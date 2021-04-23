@@ -21,8 +21,10 @@
 #include <type_traits>
 
 #include "gtest/gtest.h"
+#include "absl/base/config.h"
 
 namespace absl {
+ABSL_NAMESPACE_BEGIN
 namespace time_internal {
 namespace cctz {
 
@@ -821,6 +823,8 @@ TEST(CivilTime, Properties) {
   EXPECT_EQ(4, ss.hour());
   EXPECT_EQ(5, ss.minute());
   EXPECT_EQ(6, ss.second());
+  EXPECT_EQ(weekday::tuesday, get_weekday(ss));
+  EXPECT_EQ(34, get_yearday(ss));
 
   civil_minute mm(2015, 2, 3, 4, 5, 6);
   EXPECT_EQ(2015, mm.year());
@@ -829,6 +833,8 @@ TEST(CivilTime, Properties) {
   EXPECT_EQ(4, mm.hour());
   EXPECT_EQ(5, mm.minute());
   EXPECT_EQ(0, mm.second());
+  EXPECT_EQ(weekday::tuesday, get_weekday(mm));
+  EXPECT_EQ(34, get_yearday(mm));
 
   civil_hour hh(2015, 2, 3, 4, 5, 6);
   EXPECT_EQ(2015, hh.year());
@@ -837,6 +843,8 @@ TEST(CivilTime, Properties) {
   EXPECT_EQ(4, hh.hour());
   EXPECT_EQ(0, hh.minute());
   EXPECT_EQ(0, hh.second());
+  EXPECT_EQ(weekday::tuesday, get_weekday(hh));
+  EXPECT_EQ(34, get_yearday(hh));
 
   civil_day d(2015, 2, 3, 4, 5, 6);
   EXPECT_EQ(2015, d.year());
@@ -855,6 +863,8 @@ TEST(CivilTime, Properties) {
   EXPECT_EQ(0, m.hour());
   EXPECT_EQ(0, m.minute());
   EXPECT_EQ(0, m.second());
+  EXPECT_EQ(weekday::sunday, get_weekday(m));
+  EXPECT_EQ(32, get_yearday(m));
 
   civil_year y(2015, 2, 3, 4, 5, 6);
   EXPECT_EQ(2015, y.year());
@@ -863,6 +873,8 @@ TEST(CivilTime, Properties) {
   EXPECT_EQ(0, y.hour());
   EXPECT_EQ(0, y.minute());
   EXPECT_EQ(0, y.second());
+  EXPECT_EQ(weekday::thursday, get_weekday(y));
+  EXPECT_EQ(1, get_yearday(y));
 }
 
 TEST(CivilTime, OutputStream) {
@@ -1004,19 +1016,13 @@ TEST(CivilTime, LeapYears) {
       int day;
     } leap_day;  // The date of the day after Feb 28.
   } kLeapYearTable[]{
-      {1900, 365, {3, 1}},
-      {1999, 365, {3, 1}},
+      {1900, 365, {3, 1}},  {1999, 365, {3, 1}},
       {2000, 366, {2, 29}},  // leap year
-      {2001, 365, {3, 1}},
-      {2002, 365, {3, 1}},
-      {2003, 365, {3, 1}},
-      {2004, 366, {2, 29}},  // leap year
-      {2005, 365, {3, 1}},
-      {2006, 365, {3, 1}},
-      {2007, 365, {3, 1}},
-      {2008, 366, {2, 29}},  // leap year
-      {2009, 365, {3, 1}},
-      {2100, 365, {3, 1}},
+      {2001, 365, {3, 1}},  {2002, 365, {3, 1}},
+      {2003, 365, {3, 1}},  {2004, 366, {2, 29}},  // leap year
+      {2005, 365, {3, 1}},  {2006, 365, {3, 1}},
+      {2007, 365, {3, 1}},  {2008, 366, {2, 29}},  // leap year
+      {2009, 365, {3, 1}},  {2100, 365, {3, 1}},
   };
 
   for (const auto& e : kLeapYearTable) {
@@ -1046,4 +1052,5 @@ TEST(CivilTime, FirstThursdayInMonth) {
 
 }  // namespace cctz
 }  // namespace time_internal
+ABSL_NAMESPACE_END
 }  // namespace absl

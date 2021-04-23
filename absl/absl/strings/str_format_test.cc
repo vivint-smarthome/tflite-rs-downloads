@@ -10,6 +10,7 @@
 #include "absl/strings/string_view.h"
 
 namespace absl {
+ABSL_NAMESPACE_BEGIN
 namespace {
 using str_format_internal::FormatArgImpl;
 
@@ -30,8 +31,8 @@ TEST_F(FormatEntryPointTest, UntypedFormat) {
     "",
     "a",
     "%80d",
-#if !defined(_MSC_VER) && !defined(__ANDROID__)
-    // MSVC and Android don't support positional syntax.
+#if !defined(_MSC_VER) && !defined(__ANDROID__) && !defined(__native_client__)
+    // MSVC, NaCL and Android don't support positional syntax.
     "complicated multipart %% %1$d format %1$0999d",
 #endif  // _MSC_VER
   };
@@ -153,17 +154,20 @@ TEST_F(FormatEntryPointTest, Stream) {
     "",
     "a",
     "%80d",
-#if !defined(_MSC_VER) && !defined(__ANDROID__)
-    // MSVC doesn't support positional syntax.
+    "%d %u %c %s %f %g",
+#if !defined(_MSC_VER) && !defined(__ANDROID__) && !defined(__native_client__)
+    // MSVC, NaCL and Android don't support positional syntax.
     "complicated multipart %% %1$d format %1$080d",
 #endif  // _MSC_VER
   };
   std::string buf(4096, '\0');
   for (const auto& fmt : formats) {
-    const auto parsed = ParsedFormat<'d'>::NewAllowIgnored(fmt);
+    const auto parsed =
+        ParsedFormat<'d', 'u', 'c', 's', 'f', 'g'>::NewAllowIgnored(fmt);
     std::ostringstream oss;
-    oss << StreamFormat(*parsed, 123);
-    int fmt_result = snprintf(&*buf.begin(), buf.size(), fmt.c_str(), 123);
+    oss << StreamFormat(*parsed, 123, 3, 49, "multistreaming!!!", 1.01, 1.01);
+    int fmt_result = snprintf(&*buf.begin(), buf.size(), fmt.c_str(),  //
+                                 123, 3, 49, "multistreaming!!!", 1.01, 1.01);
     ASSERT_TRUE(oss) << fmt;
     ASSERT_TRUE(fmt_result >= 0 && static_cast<size_t>(fmt_result) < buf.size())
         << fmt_result;
@@ -446,7 +450,7 @@ struct SummarizeConsumer {
     if (conv.precision.is_from_arg()) {
       *out += "." + std::to_string(conv.precision.get_from_arg()) + "$*";
     }
-    *out += conv.conv.Char();
+    *out += FormatConversionCharToChar(conv.conv);
     *out += "}";
     return true;
   }
@@ -619,6 +623,7 @@ TEST_F(FormatWrapperTest, ParsedFormat) {
 }
 
 }  // namespace
+ABSL_NAMESPACE_END
 }  // namespace absl
 
 // Some codegen thunks that we can use to easily dump the generated assembly for
