@@ -51,4 +51,13 @@ bool Context::performance_advisory(PerformanceAdvisory advisory) const {
   return ctx().performance_advisory(advisory);
 }
 
+void Context::set_runtime_enabled_paths(Path paths) {
+  mutable_ctx()->SetRuntimeEnabledPaths(paths);
+}
+
+Path Context::get_runtime_enabled_paths() {
+  // The `& kAllPaths` hides internal test-only paths.
+  return mutable_ctx()->GetRuntimeEnabledPaths() & ruy::kAllPaths;
+}
+
 }  // namespace ruy

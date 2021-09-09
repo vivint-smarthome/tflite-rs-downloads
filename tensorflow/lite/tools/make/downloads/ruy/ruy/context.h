@@ -20,8 +20,6 @@ limitations under the License.
 
 #include <cstdint>
 
-#include "ruy/performance_advisory.h"
-
 namespace ruy {
 
 class Ctx;
@@ -80,6 +78,20 @@ class Context final {
   // When using Matrix::set_cache_policy(), this Context will keep a cache of
   // pre-packed matrix data. This function clears that cache.
   void ClearPrepackedCache();
+
+  // Override auto-detection of supported code paths.
+  //
+  // Passing `paths == Path::kNone` means reverting to the default behavior.
+  // This will trigger auto-detection on the next use.
+  //
+  // Other values will override auto-detection with the explicitly provided set
+  // of paths.
+  //
+  // Paths in kNonArchPaths are always implicitly supported.
+  void set_runtime_enabled_paths(Path paths);
+
+  // Returns the set of Path's that are available.
+  Path get_runtime_enabled_paths();
 
  private:
   CtxImpl* const impl_;

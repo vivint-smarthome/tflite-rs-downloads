@@ -250,8 +250,7 @@ template<> EIGEN_DEVICE_FUNC inline double pzero<double>(const double& a) {
 
 template <typename RealScalar>
 EIGEN_DEVICE_FUNC inline std::complex<RealScalar> ptrue(const std::complex<RealScalar>& /*a*/) {
-  RealScalar b;
-  b = ptrue(b);
+  RealScalar b = ptrue(RealScalar(0));
   return std::complex<RealScalar>(b, b);
 }
 
@@ -267,37 +266,43 @@ EIGEN_DEVICE_FUNC inline Packet bitwise_helper(const Packet& a, const Packet& b,
   return c;
 }
 
+template<typename T>
+struct bit_and {
+  EIGEN_DEVICE_FUNC EIGEN_CONSTEXPR EIGEN_ALWAYS_INLINE T operator()(const T& a, const T& b) const {
+    return a & b;
+  }
+};
+
+template<typename T>
+struct bit_or {
+  EIGEN_DEVICE_FUNC EIGEN_CONSTEXPR EIGEN_ALWAYS_INLINE T operator()(const T& a, const T& b) const {
+    return a | b;
+  }
+};
+
+template<typename T>
+struct bit_xor {
+  EIGEN_DEVICE_FUNC EIGEN_CONSTEXPR EIGEN_ALWAYS_INLINE T operator()(const T& a, const T& b) const {
+    return a ^ b;
+  }
+};
+
 /** \internal \returns the bitwise and of \a a and \a b */
 template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
 pand(const Packet& a, const Packet& b) {
-#if defined(EIGEN_HIP_DEVICE_COMPILE)
-  return bitwise_helper(a ,b, std::bit_and<unsigned char>());
-#else
-  EIGEN_USING_STD(bit_and);
-  return bitwise_helper(a ,b, bit_and<unsigned char>());
-#endif
+  return bitwise_helper(a, b, bit_and<unsigned char>());
 }
 
 /** \internal \returns the bitwise or of \a a and \a b */
 template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
 por(const Packet& a, const Packet& b) {
-#if defined(EIGEN_HIP_DEVICE_COMPILE)
-  return bitwise_helper(a ,b, std::bit_or<unsigned char>());
-#else
-  EIGEN_USING_STD(bit_or);
   return bitwise_helper(a ,b, bit_or<unsigned char>());
-#endif
 }
 
 /** \internal \returns the bitwise xor of \a a and \a b */
 template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
 pxor(const Packet& a, const Packet& b) {
-#if defined(EIGEN_HIP_DEVICE_COMPILE)
-  return bitwise_helper(a ,b, std::bit_xor<unsigned char>());
-#else
-  EIGEN_USING_STD(bit_xor);
   return bitwise_helper(a ,b, bit_xor<unsigned char>());
-#endif
 }
 
 /** \internal \returns the bitwise and of \a a and not \a b */
@@ -364,6 +369,15 @@ struct pminmax_impl<PropagateNumbers> {
   }
 };
 
+
+#ifndef SYCL_DEVICE_ONLY
+#define EIGEN_BINARY_OP_NAN_PROPAGATION(Type, Func) Func
+#else
+#define EIGEN_BINARY_OP_NAN_PROPAGATION(Type, Func) \
+[](const Type& a, const Type& b) { \
+        return Func(a, b);}
+#endif
+
 /** \internal \returns the min of \a a and \a b  (coeff-wise).
     If \a a or \b b is NaN, the return value is implementation defined. */
 template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
@@ -371,8 +385,10 @@ pmin(const Packet& a, const Packet& b) { return numext::mini(a,b); }
 
 /** \internal \returns the min of \a a and \a b  (coeff-wise).
     NaNPropagation determines the NaN propagation semantics. */
-template<int NaNPropagation, typename Packet> EIGEN_DEVICE_FUNC inline Packet
-pmin(const Packet& a, const Packet& b) { return pminmax_impl<NaNPropagation>::run(a,b, pmin<Packet>); }
+template <int NaNPropagation, typename Packet>
+EIGEN_DEVICE_FUNC inline Packet pmin(const Packet& a, const Packet& b) {
+  return pminmax_impl<NaNPropagation>::run(a, b, EIGEN_BINARY_OP_NAN_PROPAGATION(Packet, (pmin<Packet>)));
+}
 
 /** \internal \returns the max of \a a and \a b  (coeff-wise)
     If \a a or \b b is NaN, the return value is implementation defined. */
@@ -381,8 +397,10 @@ pmax(const Packet& a, const Packet& b) { return numext::maxi(a, b); }
 
 /** \internal \returns the max of \a a and \a b  (coeff-wise).
     NaNPropagation determines the NaN propagation semantics. */
-template<int NaNPropagation, typename Packet> EIGEN_DEVICE_FUNC inline Packet
-pmax(const Packet& a, const Packet& b) { return pminmax_impl<NaNPropagation>::run(a,b, pmax<Packet>); }
+template <int NaNPropagation, typename Packet>
+EIGEN_DEVICE_FUNC inline Packet pmax(const Packet& a, const Packet& b) {
+  return pminmax_impl<NaNPropagation>::run(a, b, EIGEN_BINARY_OP_NAN_PROPAGATION(Packet,(pmax<Packet>)));
+}
 
 /** \internal \returns the absolute value of \a a */
 template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
@@ -393,6 +411,12 @@ template<> EIGEN_DEVICE_FUNC inline unsigned long
 pabs(const unsigned long& a) { return a; }
 template<> EIGEN_DEVICE_FUNC inline unsigned long long
 pabs(const unsigned long long& a) { return a; }
+
+/** \internal \returns the addsub value of \a a,b */
+template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
+paddsub(const Packet& a, const Packet& b) {
+  return pselect(peven_mask(a), padd(a, b), psub(a, b));
+ }
 
 /** \internal \returns the phase angle of \a a */
 template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
@@ -424,18 +448,18 @@ template <typename Packet>
 EIGEN_DEVICE_FUNC inline Packet pfrexp(const Packet& a, Packet& exponent) {
   int exp;
   EIGEN_USING_STD(frexp);
-  Packet result = frexp(a, &exp);
+  Packet result = static_cast<Packet>(frexp(a, &exp));
   exponent = static_cast<Packet>(exp);
   return result;
 }
 
-/** \internal \returns a * 2^exponent
+/** \internal \returns a * 2^((int)exponent)
   * See https://en.cppreference.com/w/cpp/numeric/math/ldexp
   */
 template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
 pldexp(const Packet &a, const Packet &exponent) {
   EIGEN_USING_STD(ldexp)
-  return ldexp(a, static_cast<int>(exponent));
+  return static_cast<Packet>(ldexp(a, static_cast<int>(exponent)));
 }
 
 /** \internal \returns the min of \a a and \a b  (coeff-wise) */
@@ -526,6 +550,20 @@ inline void pbroadcast2(const typename unpacket_traits<Packet>::type *a,
 template<typename Packet> EIGEN_DEVICE_FUNC EIGEN_STRONG_INLINE Packet
 plset(const typename unpacket_traits<Packet>::type& a) { return a; }
 
+/** \internal \returns a packet with constant coefficients \a a, e.g.: (x, 0, x, 0),
+     where x is the value of all 1-bits. */
+template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
+peven_mask(const Packet& /*a*/) {
+  typedef typename unpacket_traits<Packet>::type Scalar;
+  const size_t n = unpacket_traits<Packet>::size;
+  EIGEN_ALIGN_TO_BOUNDARY(sizeof(Packet)) Scalar elements[n];
+  for(size_t i = 0; i < n; ++i) {
+    memset(elements+i, ((i & 1) == 0 ? 0xff : 0), sizeof(Scalar));
+  }
+  return ploadu<Packet>(elements);
+}
+
+
 /** \internal copy the packet \a from to \a *to, \a to must be 16 bytes aligned */
 template<typename Scalar, typename Packet> EIGEN_DEVICE_FUNC inline void pstore(Scalar* to, const Packet& from)
 { (*to) = from; }
@@ -555,7 +593,7 @@ template<typename Scalar> EIGEN_DEVICE_FUNC inline void prefetch(const Scalar* a
 #if defined(EIGEN_HIP_DEVICE_COMPILE)
   // do nothing
 #elif defined(EIGEN_CUDA_ARCH)
-#if defined(__LP64__)
+#if defined(__LP64__) || EIGEN_OS_WIN64
   // 64-bit pointer operand constraint for inlined asm
   asm(" prefetch.L1 [ %1 ];" : "=l"(addr) : "l"(addr));
 #else
@@ -637,9 +675,16 @@ Packet plog1p(const Packet& a) { return numext::log1p(a); }
 template<typename Packet> EIGEN_DECLARE_FUNCTION_ALLOWING_MULTIPLE_DEFINITIONS
 Packet plog10(const Packet& a) { EIGEN_USING_STD(log10); return log10(a); }
 
+/** \internal \returns the log10 of \a a (coeff-wise) */
+template<typename Packet> EIGEN_DECLARE_FUNCTION_ALLOWING_MULTIPLE_DEFINITIONS
+Packet plog2(const Packet& a) {
+  typedef typename internal::unpacket_traits<Packet>::type Scalar;
+  return pmul(pset1<Packet>(Scalar(EIGEN_LOG2E)), plog(a)); 
+}
+
 /** \internal \returns the square-root of \a a (coeff-wise) */
 template<typename Packet> EIGEN_DECLARE_FUNCTION_ALLOWING_MULTIPLE_DEFINITIONS
-Packet psqrt(const Packet& a) { EIGEN_USING_STD(sqrt); return sqrt(a); }
+Packet psqrt(const Packet& a) { return numext::sqrt(a); }
 
 /** \internal \returns the reciprocal square-root of \a a (coeff-wise) */
 template<typename Packet> EIGEN_DECLARE_FUNCTION_ALLOWING_MULTIPLE_DEFINITIONS
@@ -686,7 +731,7 @@ EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type
 predux_helper(const Packet& a, Op op) {
   typedef typename unpacket_traits<Packet>::type Scalar;
   const size_t n = unpacket_traits<Packet>::size;
-  Scalar elements[n];
+  EIGEN_ALIGN_TO_BOUNDARY(sizeof(Packet)) Scalar elements[n];
   pstoreu<Scalar>(elements, a);
   for(size_t k = n / 2; k > 0; k /= 2)  {
     for(size_t i = 0; i < k; ++i) {
@@ -705,42 +750,44 @@ predux(const Packet& a)
 }
 
 /** \internal \returns the product of the elements of \a a */
-template<typename Packet>
-EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type
-predux_mul(const Packet& a)
-{
-  return predux_helper(a, pmul<typename unpacket_traits<Packet>::type>);
+template <typename Packet>
+EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type predux_mul(
+    const Packet& a) {
+  typedef typename unpacket_traits<Packet>::type Scalar; 
+  return predux_helper(a, EIGEN_BINARY_OP_NAN_PROPAGATION(Scalar, (pmul<Scalar>)));
 }
 
 /** \internal \returns the min of the elements of \a a */
-template<typename Packet>
-EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type
-predux_min(const Packet& a)
-{
-  return predux_helper(a, pmin<PropagateFast, typename unpacket_traits<Packet>::type>);
+template <typename Packet>
+EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type predux_min(
+    const Packet &a) {
+  typedef typename unpacket_traits<Packet>::type Scalar; 
+  return predux_helper(a, EIGEN_BINARY_OP_NAN_PROPAGATION(Scalar, (pmin<PropagateFast, Scalar>)));
 }
 
-template<int NaNPropagation, typename Packet>
-EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type
-predux_min(const Packet& a)
-{
-  return predux_helper(a, pmin<NaNPropagation, typename unpacket_traits<Packet>::type>);
+template <int NaNPropagation, typename Packet>
+EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type predux_min(
+    const Packet& a) {
+  typedef typename unpacket_traits<Packet>::type Scalar; 
+  return predux_helper(a, EIGEN_BINARY_OP_NAN_PROPAGATION(Scalar, (pmin<NaNPropagation, Scalar>)));
 }
 
-/** \internal \returns the max of the elements of \a a */
-template<typename Packet>
-EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type
-predux_max(const Packet& a)
-{
-  return predux_helper(a, pmax<PropagateFast, typename unpacket_traits<Packet>::type>);
+/** \internal \returns the min of the elements of \a a */
+template <typename Packet>
+EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type predux_max(
+    const Packet &a) {
+  typedef typename unpacket_traits<Packet>::type Scalar; 
+  return predux_helper(a, EIGEN_BINARY_OP_NAN_PROPAGATION(Scalar, (pmax<PropagateFast, Scalar>)));
 }
 
-template<int NaNPropagation, typename Packet>
-EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type
-predux_max(const Packet& a)
-{
-  return predux_helper(a, pmax<NaNPropagation, typename unpacket_traits<Packet>::type>);
+template <int NaNPropagation, typename Packet>
+EIGEN_DEVICE_FUNC inline typename unpacket_traits<Packet>::type predux_max(
+    const Packet& a) {
+  typedef typename unpacket_traits<Packet>::type Scalar; 
+  return predux_helper(a, EIGEN_BINARY_OP_NAN_PROPAGATION(Scalar, (pmax<NaNPropagation, Scalar>)));
 }
+
+#undef EIGEN_BINARY_OP_NAN_PROPAGATION
 
 /** \internal \returns true if all coeffs of \a a means "true"
   * It is supposed to be called on values returned by pcmp_*.
@@ -857,28 +904,6 @@ template<typename Packet> EIGEN_DEVICE_FUNC inline Packet
 pblend(const Selector<unpacket_traits<Packet>::size>& ifPacket, const Packet& thenPacket, const Packet& elsePacket) {
   return ifPacket.select[0] ? thenPacket : elsePacket;
 }
-
-/***************************************************************************
- * Some generic implementations to be used by implementors
-***************************************************************************/
-
-/** Default implementation of pfrexp for float.
-  * It is expected to be called by implementers of template<> pfrexp.
-  */
-template<typename Packet> EIGEN_STRONG_INLINE Packet
-pfrexp_float(const Packet& a, Packet& exponent);
-
-/** Default implementation of pldexp for float.
-  * It is expected to be called by implementers of template<> pldexp.
-  */
-template<typename Packet> EIGEN_STRONG_INLINE Packet
-pldexp_float(Packet a, Packet exponent);
-
-/** Default implementation of pldexp for double.
-  * It is expected to be called by implementers of template<> pldexp.
-  */
-template<typename Packet> EIGEN_STRONG_INLINE Packet
-pldexp_double(Packet a, Packet exponent);
 
 } // end namespace internal
 

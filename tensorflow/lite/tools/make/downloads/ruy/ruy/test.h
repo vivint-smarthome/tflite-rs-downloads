@@ -107,6 +107,7 @@ inline const char* PathName(Path path) {
 #elif RUY_PLATFORM_X86
     RUY_PATHNAME_CASE(kAvx2Fma)
     RUY_PATHNAME_CASE(kAvx512)
+    RUY_PATHNAME_CASE(kAvx)
 #endif
     default:
       RUY_CHECK(false);
@@ -120,8 +121,9 @@ inline const char* TuningName(Tuning tuning) {
   case Tuning::NAME:               \
     return #NAME;
   switch (tuning) {
-    RUY_SUBPATHNAME_CASE(kInOrder)
-    RUY_SUBPATHNAME_CASE(kOutOfOrder)
+    RUY_SUBPATHNAME_CASE(kA55ish)
+    RUY_SUBPATHNAME_CASE(kX1)
+    RUY_SUBPATHNAME_CASE(kGeneric)
     default:
       RUY_CHECK(false);
       return nullptr;
@@ -1354,9 +1356,9 @@ bool Agree(ExternalPath external_path1, const Matrix<Scalar>& matrix1,
   const int size = matrix1.layout().rows() * matrix1.layout().cols();
   double tolerated_max_diff = 0;
   double tolerated_mean_diff = 0;
+  const float kSmallestAllowedDifference =
+      4. * std::numeric_limits<Scalar>::epsilon();
   if (std::is_floating_point<Scalar>::value) {
-    // TODO: replace hardcoded 100 by something more sensible, probably
-    // roughly sqrt(depth) based on central limit theorem.
     double max_abs_val = 0;
     for (int row = 0; row < matrix1.layout().rows(); row++) {
       for (int col = 0; col < matrix1.layout().cols(); col++) {
@@ -1370,6 +1372,18 @@ bool Agree(ExternalPath external_path1, const Matrix<Scalar>& matrix1,
     }
     tolerated_max_diff = max_abs_val * std::numeric_limits<Scalar>::epsilon() *
                          64 * std::sqrt(static_cast<float>(depth));
+    if (tolerated_max_diff < kSmallestAllowedDifference) {
+      // Clamp the tolerated max diff to be a bit above machine epsilon if the
+      // calculated value is too small.
+      tolerated_max_diff = kSmallestAllowedDifference;
+      if (external_path1 == ExternalPath::kEigen ||
+          external_path2 == ExternalPath::kEigen ||
+          external_path1 == ExternalPath::kEigenTensor ||
+          external_path2 == ExternalPath::kEigenTensor) {
+        // Make additional allowance for Eigen differences.
+        tolerated_max_diff *= 10.0f;
+      }
+    }
     tolerated_mean_diff = tolerated_max_diff / std::sqrt(size);
   } else if (std::is_same<Scalar, std::int32_t>::value) {
     // raw integer case, no rounding, so we can require exactness
@@ -1389,14 +1403,19 @@ bool Agree(ExternalPath external_path1, const Matrix<Scalar>& matrix1,
       // the difference may have to be as large as 2.
       tolerated_max_diff = 2;
     } else if (RUY_PLATFORM_ARM) {
-      // All our code paths on ARM, including SIMD paths, are bit-exact
+      // All our code paths on ARM (32 and 64-bit) are bit-exact
       // with the reference code (by design of the reference code).
       tolerated_max_diff = 0;
+    } else if (RUY_PLATFORM_X86) {
+      // Our reference and ARM paths have diverged from x86 paths in PR #227.
+      // TODO: update the x86 path to adapt to that and reset that tolerance
+      // to 0.
+      tolerated_max_diff = 1;
     } else {
-      // In this case, we are comparing ruy paths only, but outside of ARM.
-      // At the moment, it so happens that ruy's x86 SIMD code paths only have
-      // a difference of +/- 1, so we control that, but that is OK to relax as
-      // needed on x86 or any other architecture.
+      // Other architectures, which we don't have dedicated code paths for
+      // at the moment.
+      // TODO: try resetting that tolerance to 0, since by
+      // definition we're only using non-optimized code paths here.
       tolerated_max_diff = 1;
     }
 
@@ -1441,6 +1460,51 @@ bool Agree(const TestResult<Scalar>& result1, const TestResult<Scalar>& result2,
            int depth) {
   return Agree(result1.external_path, result1.storage_matrix,
                result2.external_path, result2.storage_matrix, depth);
+}
+
+template <typename Scalar>
+void AddTestResultToCluster(
+    TestResult<Scalar>** result,
+    std::vector<std::vector<TestResult<Scalar>*>>& clusters, int depth) {
+  bool inserted = false;
+  for (auto& cluster : clusters) {
+    bool agreement = true;
+    // Test for agreement with every result in the cluster.
+    for (auto& other_result : cluster) {
+      agreement &= Agree(**result, *other_result, depth);
+    }
+    if (agreement) {
+      cluster.push_back(*result);
+      inserted = true;
+    }
+  }
+  if (!inserted) {
+    std::vector<TestResult<Scalar>*> new_results;
+    new_results.push_back(*result);
+    clusters.push_back(new_results);
+  }
+}
+
+template <typename Scalar>
+void PrintPathsInAgreement(
+    const std::vector<std::unique_ptr<TestResult<Scalar>>>& results,
+    int depth) {
+  // A container holding vectors of TestResults, where membership indicates
+  // that all TestResults agree with each other.
+  std::vector<std::vector<TestResult<Scalar>*>> clusters;
+  for (const auto& result : results) {
+    TestResult<Scalar>* test_result = result.get();
+    AddTestResultToCluster(&test_result, clusters, depth);
+  }
+
+  std::cerr << "Error: Not all paths agree. \n";
+  for (auto& cluster : clusters) {
+    std::cerr << "These paths all agree with each other: ";
+    for (auto& result : cluster) {
+      std::cerr << PathName(*result) << ", ";
+    }
+    std::cerr << "but disagree with the rest.\n";
+  }
 }
 
 struct Stats {
@@ -1762,7 +1826,7 @@ inline std::vector<Tuning> EnumerateTuningsForPath(Path path, bool benchmark) {
   }
 #if RUY_PLATFORM_ARM
   if (path == Path::kNeon || path == Path::kNeonDotprod) {
-    return {Tuning::kInOrder, Tuning::kOutOfOrder, Tuning::kAuto};
+    return {Tuning::kA55ish, Tuning::kX1, Tuning::kGeneric, Tuning::kAuto};
   }
 #endif
   (void)path;
@@ -2142,17 +2206,9 @@ void TestSet<LhsScalar, RhsScalar, AccumScalar, DstScalar>::VerifyTestResults()
   const int depth = lhs.matrix.layout().cols();
   for (int i = 0; i < static_cast<int>(results.size()) - 1; i++) {
     if (!Agree(*results[i], *results[i + 1], depth)) {
-      std::string paths_in_agreement;
-      paths_in_agreement.append(PathName(*results[0]));
-      for (int j = 1; j <= i; j++) {
-        paths_in_agreement.append(", ");
-        paths_in_agreement.append(PathName(*results[j]));
-      }
+      PrintPathsInAgreement(results, depth);
       ErrorAnalysis error_analysis;
       AnalyzeTestError(*this, i + 1, &error_analysis);
-      std::cerr << "Error: path (" << PathName(*results[i + 1])
-                << ") disagrees with the other paths (" << paths_in_agreement
-                << "), which agree with each other." << std::endl;
       std::cerr << "Shape: rows = " << rows << ", cols = " << cols
                 << ", depth = " << depth << std::endl;
       std::cerr << "Stats of the good result matrix: "

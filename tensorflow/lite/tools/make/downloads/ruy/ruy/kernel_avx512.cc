@@ -333,23 +333,47 @@ void Kernel8bitAvx512(const KernelParams8bit<16, 16>& params) {
         const __m512i left_shift = _mm512_max_epi32(e_vector, zero_vector);
         const __m512i neg_e_vector = _mm512_sub_epi32(zero_vector, e_vector);
         const __m512i right_shift = _mm512_max_epi32(neg_e_vector, zero_vector);
-        const __m512i final_right_shift =
-            _mm512_add_epi32(right_shift, _mm512_set1_epi32(31));
+        const __m512i final_right_shift = _mm512_set1_epi32(31);
+        const __m512i right_shift_low =
+            _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 0));
+        const __m512i right_shift_high =
+            _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 1));
         const __m512i final_right_shift_low = _mm512_cvtepi32_epi64(
             _mm512_extracti32x8_epi32(final_right_shift, 0));
         const __m512i final_right_shift_high = _mm512_cvtepi32_epi64(
             _mm512_extracti32x8_epi32(final_right_shift, 1));
 
+        // A "half" added for rounding prior to truncation of 64-bit value.
         const __m512i offset_vector =
             _mm512_slli_epi64(_mm512_set1_epi64(1), 30);
-        // Really these should be shifted by neg_e_vector, but tests pass when
-        // using right_shift.
-        const __m512i offset_vector_low = _mm512_sllv_epi64(
-            offset_vector,
-            _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 0)));
-        const __m512i offset_vector_high = _mm512_sllv_epi64(
-            offset_vector,
-            _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 1)));
+
+        auto rounding_right_shift = [=](__m512i& results,
+                                        const __m512i& exponent) {
+          // Construct the "nudge" value for each lane if the exponent is
+          // greater than 0. Otherwise, the nudge is 0.
+          const __m512i zeros = _mm512_setzero_si512();
+          const auto mask_rightshift_gtz =
+              _mm512_cmpgt_epi64_mask(exponent, zeros);
+          const __m512i one_shift_exp_minus1 = _mm512_sllv_epi64(
+              _mm512_set1_epi64(1),
+              _mm512_sub_epi64(exponent, _mm512_set1_epi64(1)));
+          __m512i nudge = _mm512_mask_mov_epi64(zeros, mask_rightshift_gtz,
+                                                one_shift_exp_minus1);
+          // Calculate the shifted sum (results + nudge) >> exp.
+          const __m512i r_plus_nudge = _mm512_add_epi64(results, nudge);
+          const __m512i shifted_sum = _mm512_srav_epi64(r_plus_nudge, exponent);
+
+          // Identify overflow in each lane and create mask.
+          const __m512i one_shift_31minus_exp = _mm512_sllv_epi64(
+              _mm512_set1_epi64(1),
+              _mm512_sub_epi64(_mm512_set1_epi64(31), exponent));
+          const auto mask_num_plus_nudge_overflow = _mm512_cmpgt_epi64_mask(
+              results, _mm512_sub_epi64(_mm512_set1_epi64(0x7fffffff), nudge));
+          // Fill results with either (results + nudge) >> exponent or
+          // 1 << (31 - exp) in the case of overflow.
+          results = _mm512_mask_mov_epi64(
+              shifted_sum, mask_num_plus_nudge_overflow, one_shift_31minus_exp);
+        };
 
         if (per_column_multiplier) {
           auto apply_multiplier = [=](__m512i& accum, int col) {
@@ -359,12 +383,13 @@ void Kernel8bitAvx512(const KernelParams8bit<16, 16>& params) {
                 _mm512_permutexvar_epi32(_mm512_set1_epi32(col), left_shift);
             __m512i m_64bit_val = _mm512_permutexvar_epi64(
                 perm_64bit_vals, col < 8 ? m_64bit_low : m_64bit_high);
-            __m512i offset_vector_val = _mm512_permutexvar_epi64(
-                perm_64bit_vals,
-                col < 8 ? offset_vector_low : offset_vector_high);
+            __m512i offset_vector_val =
+                _mm512_permutexvar_epi64(perm_64bit_vals, offset_vector);
             __m512i final_right_shift_val = _mm512_permutexvar_epi64(
                 perm_64bit_vals,
                 col < 8 ? final_right_shift_low : final_right_shift_high);
+            __m512i right_shift_val = _mm512_permutexvar_epi64(
+                perm_64bit_vals, col < 8 ? right_shift_low : right_shift_high);
 
             accum = _mm512_sllv_epi32(accum, left_shift_val);
             __m512i scaled_v_low = _mm512_mul_epi32(
@@ -381,6 +406,9 @@ void Kernel8bitAvx512(const KernelParams8bit<16, 16>& params) {
                 _mm512_srav_epi64(scaled_v_low, final_right_shift_val);
             scaled_v_high =
                 _mm512_srav_epi64(scaled_v_high, final_right_shift_val);
+
+            rounding_right_shift(scaled_v_low, right_shift_val);
+            rounding_right_shift(scaled_v_high, right_shift_val);
 
             accum = _mm512_castsi256_si512(_mm512_cvtepi64_epi32(scaled_v_low));
             accum = _mm512_inserti32x8(accum,
@@ -413,14 +441,16 @@ void Kernel8bitAvx512(const KernelParams8bit<16, 16>& params) {
                 _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(accum, 1)),
                 m_64bit_high);
 
-            scaled_v_low = _mm512_add_epi64(scaled_v_low, offset_vector_low);
-            scaled_v_high = _mm512_add_epi64(scaled_v_high, offset_vector_high);
+            scaled_v_low = _mm512_add_epi64(scaled_v_low, offset_vector);
+            scaled_v_high = _mm512_add_epi64(scaled_v_high, offset_vector);
 
             scaled_v_low =
                 _mm512_srav_epi64(scaled_v_low, final_right_shift_low);
             scaled_v_high =
                 _mm512_srav_epi64(scaled_v_high, final_right_shift_high);
 
+            rounding_right_shift(scaled_v_low, right_shift_low);
+            rounding_right_shift(scaled_v_high, right_shift_high);
             accum = _mm512_castsi256_si512(_mm512_cvtepi64_epi32(scaled_v_low));
             accum = _mm512_inserti32x8(accum,
                                        _mm512_cvtepi64_epi32(scaled_v_high), 1);
@@ -713,22 +743,46 @@ void Kernel8bitAvx512SingleCol(const KernelParams8bit<16, 16>& params) {
       const __m512i left_shift = _mm512_max_epi32(e_vector, zero_vector);
       const __m512i neg_e_vector = _mm512_sub_epi32(zero_vector, e_vector);
       const __m512i right_shift = _mm512_max_epi32(neg_e_vector, zero_vector);
-      const __m512i final_right_shift =
-          _mm512_add_epi32(right_shift, _mm512_set1_epi32(31));
+      const __m512i final_right_shift = _mm512_set1_epi32(31);
+      const __m512i right_shift_low =
+          _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 0));
+      const __m512i right_shift_high =
+          _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 1));
       const __m512i final_right_shift_low = _mm512_cvtepi32_epi64(
           _mm512_extracti32x8_epi32(final_right_shift, 0));
       const __m512i final_right_shift_high = _mm512_cvtepi32_epi64(
           _mm512_extracti32x8_epi32(final_right_shift, 1));
 
+      // A "half" added for rounding prior to truncation of 64-bit value.
       const __m512i offset_vector = _mm512_slli_epi64(_mm512_set1_epi64(1), 30);
-      // Really these should be shifted by neg_e_vector, but tests pass when
-      // using right_shift.
-      const __m512i offset_vector_low = _mm512_sllv_epi64(
-          offset_vector,
-          _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 0)));
-      const __m512i offset_vector_high = _mm512_sllv_epi64(
-          offset_vector,
-          _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(right_shift, 1)));
+
+      auto rounding_right_shift = [=](__m512i& results,
+                                      const __m512i& exponent) {
+        // Construct the "nudge" value for each lane if the exponent is
+        // greater than 0. Otherwise, the nudge is 0.
+        const __m512i zeros = _mm512_setzero_si512();
+        const auto mask_rightshift_gtz =
+            _mm512_cmpgt_epi64_mask(exponent, zeros);
+        const __m512i one_shift_exp_minus1 =
+            _mm512_sllv_epi64(_mm512_set1_epi64(1),
+                              _mm512_sub_epi64(exponent, _mm512_set1_epi64(1)));
+        __m512i nudge = _mm512_mask_mov_epi64(zeros, mask_rightshift_gtz,
+                                              one_shift_exp_minus1);
+        // Calculate the shifted sum (results + nudge) >> exp.
+        const __m512i r_plus_nudge = _mm512_add_epi64(results, nudge);
+        const __m512i shifted_sum = _mm512_srav_epi64(r_plus_nudge, exponent);
+
+        // Identify overflow in each lane and create mask.
+        const __m512i one_shift_31minus_exp = _mm512_sllv_epi64(
+            _mm512_set1_epi64(1),
+            _mm512_sub_epi64(_mm512_set1_epi64(31), exponent));
+        const auto mask_num_plus_nudge_overflow = _mm512_cmpgt_epi64_mask(
+            results, _mm512_sub_epi64(_mm512_set1_epi64(0x7fffffff), nudge));
+        // Fill results with either (results + nudge) >> exponent or
+        // 1 << (31 - exp) in the case of overflow.
+        results = _mm512_mask_mov_epi64(
+            shifted_sum, mask_num_plus_nudge_overflow, one_shift_31minus_exp);
+      };
 
       // Shift and round column 0.
       accum_data_v0 = _mm512_sllv_epi32(accum_data_v0, left_shift);
@@ -740,11 +794,14 @@ void Kernel8bitAvx512SingleCol(const KernelParams8bit<16, 16>& params) {
           _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(accum_data_v0, 1)),
           m_64bit_high);
 
-      scaled_v_low = _mm512_add_epi64(scaled_v_low, offset_vector_low);
-      scaled_v_high = _mm512_add_epi64(scaled_v_high, offset_vector_high);
+      scaled_v_low = _mm512_add_epi64(scaled_v_low, offset_vector);
+      scaled_v_high = _mm512_add_epi64(scaled_v_high, offset_vector);
 
       scaled_v_low = _mm512_srav_epi64(scaled_v_low, final_right_shift_low);
       scaled_v_high = _mm512_srav_epi64(scaled_v_high, final_right_shift_high);
+
+      rounding_right_shift(scaled_v_low, right_shift_low);
+      rounding_right_shift(scaled_v_high, right_shift_high);
 
       accum_data_v0 =
           _mm512_castsi256_si512(_mm512_cvtepi64_epi32(scaled_v_low));
@@ -830,9 +887,8 @@ void KernelFloatAvx512(const KernelParamsFloat<16, 16>& params) {
       float* dst_ptr = dst_col_ptr + row;
 
       // Process block in two halves, split by columns.
-      {
-        constexpr int mmm = 0;
-
+#pragma unroll(1)
+      for (int mmm = 0; mmm < 2; ++mmm) {
         __m512 accum_data_v0;
         __m512 accum_data_v1;
         __m512 accum_data_v2;
@@ -872,70 +928,49 @@ void KernelFloatAvx512(const KernelParamsFloat<16, 16>& params) {
         const float* rhs_ptr = rhs_col_ptr + 8 * mmm;
         for (int d = 0; d < (params.depth - 1); ++d) {
           const __m512 lhs_data = _mm512_loadu_ps(lhs_ptr);
-          // In this version RHS values are loaded individually rather than
-          // first loading together and then extract with broadcasting. This is
-          // because AVX flavours and instrinsics and compilers in combination
-          // do not handle this pattern of extraction very well.
           const float* rhs_data = rhs_ptr;
           lhs_ptr += 16;
           rhs_ptr += 16;
 
-          {
-            const __m512 dup_rhs_element_j0 = _mm512_set1_ps(rhs_data[0]);
-            accum_data_v0 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j0, accum_data_v0);
-            const __m512 dup_rhs_element_j1 = _mm512_set1_ps(rhs_data[1]);
-            accum_data_v1 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j1, accum_data_v1);
-            const __m512 dup_rhs_element_j2 = _mm512_set1_ps(rhs_data[2]);
-            accum_data_v2 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j2, accum_data_v2);
-            const __m512 dup_rhs_element_j3 = _mm512_set1_ps(rhs_data[3]);
-            accum_data_v3 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j3, accum_data_v3);
-            const __m512 dup_rhs_element_j4 = _mm512_set1_ps(rhs_data[4]);
-            accum_data_v4 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j4, accum_data_v4);
-            const __m512 dup_rhs_element_j5 = _mm512_set1_ps(rhs_data[5]);
-            accum_data_v5 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j5, accum_data_v5);
-            const __m512 dup_rhs_element_j6 = _mm512_set1_ps(rhs_data[6]);
-            accum_data_v6 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j6, accum_data_v6);
-            const __m512 dup_rhs_element_j7 = _mm512_set1_ps(rhs_data[7]);
-            accum_data_v7 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j7, accum_data_v7);
-          }
+          // GCC and clang can fuse set1+FMA into an FMA with EVEX broadcast:
+          // https://gcc.godbolt.org/z/xbfqWYfn1. Clang is more likely to do
+          // so if given an rvalue.
+          accum_data_v0 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[0]),
+                                          accum_data_v0);
+          accum_data_v1 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[1]),
+                                          accum_data_v1);
+          accum_data_v2 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[2]),
+                                          accum_data_v2);
+          accum_data_v3 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[3]),
+                                          accum_data_v3);
+          accum_data_v4 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[4]),
+                                          accum_data_v4);
+          accum_data_v5 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[5]),
+                                          accum_data_v5);
+          accum_data_v6 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[6]),
+                                          accum_data_v6);
+          accum_data_v7 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[7]),
+                                          accum_data_v7);
         }
-        {
+        {  // nested extra blocks lead to measurable speed gains
           const __m512 lhs_data = _mm512_loadu_ps(lhs_ptr);
           const float* rhs_data = rhs_ptr;
-          {
-            const __m512 dup_rhs_element_j0 = _mm512_set1_ps(rhs_data[0]);
-            accum_data_v0 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j0, accum_data_v0);
-            const __m512 dup_rhs_element_j1 = _mm512_set1_ps(rhs_data[1]);
-            accum_data_v1 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j1, accum_data_v1);
-            const __m512 dup_rhs_element_j2 = _mm512_set1_ps(rhs_data[2]);
-            accum_data_v2 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j2, accum_data_v2);
-            const __m512 dup_rhs_element_j3 = _mm512_set1_ps(rhs_data[3]);
-            accum_data_v3 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j3, accum_data_v3);
-            const __m512 dup_rhs_element_j4 = _mm512_set1_ps(rhs_data[4]);
-            accum_data_v4 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j4, accum_data_v4);
-            const __m512 dup_rhs_element_j5 = _mm512_set1_ps(rhs_data[5]);
-            accum_data_v5 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j5, accum_data_v5);
-            const __m512 dup_rhs_element_j6 = _mm512_set1_ps(rhs_data[6]);
-            accum_data_v6 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j6, accum_data_v6);
-            const __m512 dup_rhs_element_j7 = _mm512_set1_ps(rhs_data[7]);
-            accum_data_v7 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j7, accum_data_v7);
-          }
+          accum_data_v0 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[0]),
+                                          accum_data_v0);
+          accum_data_v1 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[1]),
+                                          accum_data_v1);
+          accum_data_v2 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[2]),
+                                          accum_data_v2);
+          accum_data_v3 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[3]),
+                                          accum_data_v3);
+          accum_data_v4 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[4]),
+                                          accum_data_v4);
+          accum_data_v5 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[5]),
+                                          accum_data_v5);
+          accum_data_v6 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[6]),
+                                          accum_data_v6);
+          accum_data_v7 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[7]),
+                                          accum_data_v7);
           {
             float* block_ptr = dst_ptr + (mmm * 8 + 0) * dst_stride;
             accum_data_v0 = _mm512_min_ps(accum_data_v0, clamp_max_v);
@@ -964,136 +999,7 @@ void KernelFloatAvx512(const KernelParamsFloat<16, 16>& params) {
             _mm512_storeu_ps(block_ptr + 7 * dst_stride, accum_data_v7);
           }
         }
-      }  // Inner half-block loop, unrolled, first iteration.
-      {
-        constexpr int mmm = 1;
-
-        __m512 accum_data_v0;
-        __m512 accum_data_v1;
-        __m512 accum_data_v2;
-        __m512 accum_data_v3;
-        __m512 accum_data_v4;
-        __m512 accum_data_v5;
-        __m512 accum_data_v6;
-        __m512 accum_data_v7;
-
-        // Initialize with bias.
-        if (channel_dimension_is_col) {
-          const float* bias_elem_ptr =
-              bias_ptr + (col + 8 * mmm) * bias_ptr_block_increment;
-          accum_data_v0 = _mm512_set1_ps(bias_elem_ptr[0]);
-          accum_data_v1 = _mm512_set1_ps(bias_elem_ptr[1]);
-          accum_data_v2 = _mm512_set1_ps(bias_elem_ptr[2]);
-          accum_data_v3 = _mm512_set1_ps(bias_elem_ptr[3]);
-          accum_data_v4 = _mm512_set1_ps(bias_elem_ptr[4]);
-          accum_data_v5 = _mm512_set1_ps(bias_elem_ptr[5]);
-          accum_data_v6 = _mm512_set1_ps(bias_elem_ptr[6]);
-          accum_data_v7 = _mm512_set1_ps(bias_elem_ptr[7]);
-        } else {
-          const __m512 initial_accum_data =
-              _mm512_loadu_ps(bias_ptr + row * bias_ptr_block_increment);
-
-          accum_data_v0 = initial_accum_data;
-          accum_data_v1 = initial_accum_data;
-          accum_data_v2 = initial_accum_data;
-          accum_data_v3 = initial_accum_data;
-          accum_data_v4 = initial_accum_data;
-          accum_data_v5 = initial_accum_data;
-          accum_data_v6 = initial_accum_data;
-          accum_data_v7 = initial_accum_data;
-        }
-        const float* lhs_ptr = lhs_col_ptr;
-        const float* rhs_ptr = rhs_col_ptr + 8 * mmm;
-        for (int d = 0; d < (params.depth - 1); ++d) {
-          const __m512 lhs_data = _mm512_loadu_ps(lhs_ptr);
-          const float* rhs_data = rhs_ptr;
-          lhs_ptr += 16;
-          rhs_ptr += 16;
-          {
-            const __m512 dup_rhs_element_j0 = _mm512_set1_ps(rhs_data[0]);
-            accum_data_v0 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j0, accum_data_v0);
-            const __m512 dup_rhs_element_j1 = _mm512_set1_ps(rhs_data[1]);
-            accum_data_v1 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j1, accum_data_v1);
-            const __m512 dup_rhs_element_j2 = _mm512_set1_ps(rhs_data[2]);
-            accum_data_v2 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j2, accum_data_v2);
-            const __m512 dup_rhs_element_j3 = _mm512_set1_ps(rhs_data[3]);
-            accum_data_v3 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j3, accum_data_v3);
-            const __m512 dup_rhs_element_j4 = _mm512_set1_ps(rhs_data[4]);
-            accum_data_v4 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j4, accum_data_v4);
-            const __m512 dup_rhs_element_j5 = _mm512_set1_ps(rhs_data[5]);
-            accum_data_v5 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j5, accum_data_v5);
-            const __m512 dup_rhs_element_j6 = _mm512_set1_ps(rhs_data[6]);
-            accum_data_v6 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j6, accum_data_v6);
-            const __m512 dup_rhs_element_j7 = _mm512_set1_ps(rhs_data[7]);
-            accum_data_v7 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j7, accum_data_v7);
-          }
-        }
-        {
-          const __m512 lhs_data = _mm512_loadu_ps(lhs_ptr);
-          const float* rhs_data = rhs_ptr;
-          {
-            const __m512 dup_rhs_element_j0 = _mm512_set1_ps(rhs_data[0]);
-            accum_data_v0 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j0, accum_data_v0);
-            const __m512 dup_rhs_element_j1 = _mm512_set1_ps(rhs_data[1]);
-            accum_data_v1 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j1, accum_data_v1);
-            const __m512 dup_rhs_element_j2 = _mm512_set1_ps(rhs_data[2]);
-            accum_data_v2 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j2, accum_data_v2);
-            const __m512 dup_rhs_element_j3 = _mm512_set1_ps(rhs_data[3]);
-            accum_data_v3 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j3, accum_data_v3);
-            const __m512 dup_rhs_element_j4 = _mm512_set1_ps(rhs_data[4]);
-            accum_data_v4 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j4, accum_data_v4);
-            const __m512 dup_rhs_element_j5 = _mm512_set1_ps(rhs_data[5]);
-            accum_data_v5 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j5, accum_data_v5);
-            const __m512 dup_rhs_element_j6 = _mm512_set1_ps(rhs_data[6]);
-            accum_data_v6 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j6, accum_data_v6);
-            const __m512 dup_rhs_element_j7 = _mm512_set1_ps(rhs_data[7]);
-            accum_data_v7 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j7, accum_data_v7);
-          }
-          {
-            float* block_ptr = dst_ptr + (mmm * 8 + 0) * dst_stride;
-            accum_data_v0 = _mm512_min_ps(accum_data_v0, clamp_max_v);
-            accum_data_v0 = _mm512_max_ps(accum_data_v0, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 0 * dst_stride, accum_data_v0);
-            accum_data_v1 = _mm512_min_ps(accum_data_v1, clamp_max_v);
-            accum_data_v1 = _mm512_max_ps(accum_data_v1, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 1 * dst_stride, accum_data_v1);
-            accum_data_v2 = _mm512_min_ps(accum_data_v2, clamp_max_v);
-            accum_data_v2 = _mm512_max_ps(accum_data_v2, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 2 * dst_stride, accum_data_v2);
-            accum_data_v3 = _mm512_min_ps(accum_data_v3, clamp_max_v);
-            accum_data_v3 = _mm512_max_ps(accum_data_v3, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 3 * dst_stride, accum_data_v3);
-            accum_data_v4 = _mm512_min_ps(accum_data_v4, clamp_max_v);
-            accum_data_v4 = _mm512_max_ps(accum_data_v4, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 4 * dst_stride, accum_data_v4);
-            accum_data_v5 = _mm512_min_ps(accum_data_v5, clamp_max_v);
-            accum_data_v5 = _mm512_max_ps(accum_data_v5, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 5 * dst_stride, accum_data_v5);
-            accum_data_v6 = _mm512_min_ps(accum_data_v6, clamp_max_v);
-            accum_data_v6 = _mm512_max_ps(accum_data_v6, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 6 * dst_stride, accum_data_v6);
-            accum_data_v7 = _mm512_min_ps(accum_data_v7, clamp_max_v);
-            accum_data_v7 = _mm512_max_ps(accum_data_v7, clamp_min_v);
-            _mm512_storeu_ps(block_ptr + 7 * dst_stride, accum_data_v7);
-          }
-        }
-      }  // Inner half-block loop, unrolled, second iteration.
+      }
     }    // End row-block loop.
 
     // The unrolling within this conditional may be somewhat pointless. It
@@ -1151,62 +1057,45 @@ void KernelFloatAvx512(const KernelParamsFloat<16, 16>& params) {
           const float* rhs_data = rhs_ptr;
           lhs_ptr += 16;
           rhs_ptr += 16;
-          {
-            const __m512 dup_rhs_element_j0 = _mm512_set1_ps(rhs_data[0]);
-            accum_data_v0 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j0, accum_data_v0);
-            const __m512 dup_rhs_element_j1 = _mm512_set1_ps(rhs_data[1]);
-            accum_data_v1 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j1, accum_data_v1);
-            const __m512 dup_rhs_element_j2 = _mm512_set1_ps(rhs_data[2]);
-            accum_data_v2 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j2, accum_data_v2);
-            const __m512 dup_rhs_element_j3 = _mm512_set1_ps(rhs_data[3]);
-            accum_data_v3 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j3, accum_data_v3);
-            const __m512 dup_rhs_element_j4 = _mm512_set1_ps(rhs_data[4]);
-            accum_data_v4 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j4, accum_data_v4);
-            const __m512 dup_rhs_element_j5 = _mm512_set1_ps(rhs_data[5]);
-            accum_data_v5 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j5, accum_data_v5);
-            const __m512 dup_rhs_element_j6 = _mm512_set1_ps(rhs_data[6]);
-            accum_data_v6 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j6, accum_data_v6);
-            const __m512 dup_rhs_element_j7 = _mm512_set1_ps(rhs_data[7]);
-            accum_data_v7 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j7, accum_data_v7);
-          }
+          // GCC and clang can fuse set1+FMA into an FMA with EVEX broadcast:
+          // https://gcc.godbolt.org/z/xbfqWYfn1. Clang is more likely to do
+          // so if given an rvalue.
+          accum_data_v0 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[0]),
+                                          accum_data_v0);
+          accum_data_v1 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[1]),
+                                          accum_data_v1);
+          accum_data_v2 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[2]),
+                                          accum_data_v2);
+          accum_data_v3 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[3]),
+                                          accum_data_v3);
+          accum_data_v4 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[4]),
+                                          accum_data_v4);
+          accum_data_v5 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[5]),
+                                          accum_data_v5);
+          accum_data_v6 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[6]),
+                                          accum_data_v6);
+          accum_data_v7 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[7]),
+                                          accum_data_v7);
         }
         {
           const __m512 lhs_data = _mm512_loadu_ps(lhs_ptr);
           const float* rhs_data = rhs_ptr;
-          {
-            const __m512 dup_rhs_element_j0 = _mm512_set1_ps(rhs_data[0]);
-            accum_data_v0 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j0, accum_data_v0);
-            const __m512 dup_rhs_element_j1 = _mm512_set1_ps(rhs_data[1]);
-            accum_data_v1 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j1, accum_data_v1);
-            const __m512 dup_rhs_element_j2 = _mm512_set1_ps(rhs_data[2]);
-            accum_data_v2 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j2, accum_data_v2);
-            const __m512 dup_rhs_element_j3 = _mm512_set1_ps(rhs_data[3]);
-            accum_data_v3 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j3, accum_data_v3);
-            const __m512 dup_rhs_element_j4 = _mm512_set1_ps(rhs_data[4]);
-            accum_data_v4 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j4, accum_data_v4);
-            const __m512 dup_rhs_element_j5 = _mm512_set1_ps(rhs_data[5]);
-            accum_data_v5 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j5, accum_data_v5);
-            const __m512 dup_rhs_element_j6 = _mm512_set1_ps(rhs_data[6]);
-            accum_data_v6 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j6, accum_data_v6);
-            const __m512 dup_rhs_element_j7 = _mm512_set1_ps(rhs_data[7]);
-            accum_data_v7 =
-                _mm512_fmadd_ps(lhs_data, dup_rhs_element_j7, accum_data_v7);
-          }
+          accum_data_v0 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[0]),
+                                          accum_data_v0);
+          accum_data_v1 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[1]),
+                                          accum_data_v1);
+          accum_data_v2 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[2]),
+                                          accum_data_v2);
+          accum_data_v3 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[3]),
+                                          accum_data_v3);
+          accum_data_v4 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[4]),
+                                          accum_data_v4);
+          accum_data_v5 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[5]),
+                                          accum_data_v5);
+          accum_data_v6 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[6]),
+                                          accum_data_v6);
+          accum_data_v7 = _mm512_fmadd_ps(lhs_data, _mm512_set1_ps(rhs_data[7]),
+                                          accum_data_v7);
           {
             float* block_ptr = dst_ptr + (mmm * 8 + 0) * dst_stride;
             accum_data_v0 = _mm512_min_ps(accum_data_v0, clamp_max_v);

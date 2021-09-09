@@ -30,6 +30,7 @@ limitations under the License.
 #include "ruy/cpu_cache_params.h"
 #include "ruy/cpuinfo.h"
 #include "ruy/ctx.h"
+#include "ruy/denormal.h"
 #include "ruy/mat.h"
 #include "ruy/matrix.h"
 #include "ruy/mul_params.h"
@@ -38,6 +39,7 @@ limitations under the License.
 #include "ruy/side_pair.h"
 #include "ruy/size_util.h"
 #include "ruy/thread_pool.h"
+#include "ruy/trace.h"
 #include "ruy/tune.h"
 
 namespace ruy {
@@ -52,60 +54,66 @@ enum class PackingStatus : std::uint8_t {
 };
 
 // TrMulTask is the task that a ruy thread runs to perform the TrMul operation.
-struct TrMulTask final : Task {
-  TrMulTask(TrMulParams* params_, const BlockMap& block_map_,
-            std::atomic<int>* atomic_block_id_, int thread_id_,
-            bool need_atomics_,
-            SidePair<std::atomic<PackingStatus>*> packing_status_,
-            TuningResolver* tuning_resolver_, Allocator* local_allocator_)
-      : params(params_),
-        block_map(block_map_),
-        atomic_block_id(atomic_block_id_),
-        thread_id(thread_id_),
-        need_atomics(need_atomics_),
-        packing_status(packing_status_),
-        tuning_resolver(tuning_resolver_),
-        local_allocator(local_allocator_),
-        local_already_packed{nullptr, nullptr} {}
+class TrMulTask final : public Task {
+ public:
+  TrMulTask(TrMulParams* params, const BlockMap& block_map,
+            std::atomic<int>* atomic_block_id, int thread_id, bool need_atomics,
+            SidePair<std::atomic<PackingStatus>*> packing_status,
+            TuningResolver* tuning_resolver, Allocator* local_allocator,
+            CpuInfo* cpuinfo)
+      : params_(params),
+        block_map_(block_map),
+        atomic_block_id_(atomic_block_id),
+        thread_id_(thread_id),
+        need_atomics_(need_atomics),
+        packing_status_(packing_status),
+        tuning_resolver_(tuning_resolver),
+        local_allocator_(local_allocator),
+        local_already_packed_{nullptr, nullptr},
+        cpuinfo_(cpuinfo) {}
 
   // Thread main function. This is one thread's share of the TrMul work.
   void Run() override {
+    RUY_TRACE_SCOPE_NAME("TrMulTask::Run");
+    RUY_TRACE_SET_THEAD_ID(thread_id_);
     // Allocate and initialize `local_packed`.
     for (Side side : {Side::kLhs, Side::kRhs}) {
-      if (!params->is_prepacked[side]) {
-        const int size = NumBlocksPerSide(side, block_map);
-        local_allocator->Allocate(size, &local_already_packed[side]);
-        memset(local_already_packed[side], 0, size * sizeof(bool));
+      if (!params_->is_prepacked[side]) {
+        const int size = NumBlocksPerSide(side, block_map_);
+        local_allocator_->Allocate(size, &local_already_packed_[side]);
+        memset(local_already_packed_[side], 0, size * sizeof(bool));
       }
     }
 
-    const Tuning tuning = tuning_resolver->Resolve();
-    const int num_blocks = NumBlocks(block_map);
+    const Tuning tuning = tuning_resolver_->Resolve(cpuinfo_);
+    const int num_blocks = NumBlocks(block_map_);
 
     // Each thread starts by initially reserving the block whose id
     // is the thread id.
-    int block_id = thread_id;
+    int block_id = thread_id_;
     // Loop until all blocks have been computed.
     while (block_id < num_blocks) {
+      RUY_TRACE_SCOPE_NAME("Main loop iteration");
       // Reserve the next block to handle, hiding the latency of this atomic op.
       const int next_block_id =
-          atomic_block_id->fetch_add(1, std::memory_order_relaxed);
+          atomic_block_id_->fetch_add(1, std::memory_order_relaxed);
       // Get coordinates of the current block to handle, in "block space".
       SidePair<int> block;
-      GetBlockByIndex(block_map, block_id, &block);
+      GetBlockByIndex(block_map_, block_id, &block);
       // Get coordinates of the current block to handle, in matrix space.
       SidePair<int> start, end;
-      GetBlockMatrixCoords(block_map, block, &start, &end);
+      GetBlockMatrixCoords(block_map_, block, &start, &end);
+      RUY_TRACE_INFO(TRMUL_TASK_MAIN_LOOP_GOT_BLOCK_COORDS);
       // Maybe pack the current LHS/RHS block, if not already packed.
       EnsurePacked(block, start, end, tuning);
       // Actually do matrix multiplication work
-      params->RunKernel(tuning, start, end);
+      params_->RunKernel(tuning, start, end);
       // Move on to the next block as obtained by the atomic increment
       // at the start of this while loop iteration.
       block_id = next_block_id;
     }
 
-    local_allocator->FreeAll();
+    local_allocator_->FreeAll();
   }
 
  private:
@@ -114,11 +122,11 @@ struct TrMulTask final : Task {
   // If the block was not started packing, packs it and returns true.
   // If the block was being packed by another thread, returns false.
   bool TryPack(Side side, int block, int start, int end, Tuning tuning) {
-    if (params->is_prepacked[side]) {
+    if (params_->is_prepacked[side]) {
       return true;
     }
-    if (!local_already_packed[side][block]) {
-      if (need_atomics) {
+    if (!local_already_packed_[side][block]) {
+      if (need_atomics_) {
         // Explanation of this compare_exchange_strong operation:
         // This atomically performs all of the following:
         // 1. Read `status` with "acquire" memory order.
@@ -154,27 +162,33 @@ struct TrMulTask final : Task {
         // compare_exchange_strong isn't such a problem. But we don't really
         // know for sure, that would be interesting to experiment more with.
         PackingStatus exchanged_status = PackingStatus::kNotStarted;
-        std::atomic<PackingStatus>& status = packing_status[side][block];
+        std::atomic<PackingStatus>& status = packing_status_[side][block];
         if (status.compare_exchange_strong(
                 exchanged_status, PackingStatus::kInProgress,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
           // In this branch, the status was kNotStarted and we just atomically
           // changed it to kInProgress as we are about to handle the packing
           // ourselves.
-          params->RunPack(side, tuning, start, end);
+          RUY_TRACE_INFO(TRYPACK_PACKING);
+          params_->RunPack(side, tuning, start, end);
           status.store(PackingStatus::kFinished, std::memory_order_release);
         } else if (exchanged_status == PackingStatus::kInProgress) {
           // Another thread is currently packing this block.
+          RUY_TRACE_INFO(TRYPACK_ANOTHER_THREAD_PACKING);
           return false;
+        } else {
+          RUY_TRACE_INFO(TRYPACK_PACKED_BY_ANOTHER_THREAD);
         }
         RUY_DCHECK(status.load(std::memory_order_acquire) ==
                    PackingStatus::kFinished);
       } else {
         // Single-threaded case: no need for expensive atomics,
         // local_already_packed is the truth already.
-        params->RunPack(side, tuning, start, end);
+        params_->RunPack(side, tuning, start, end);
       }
-      local_already_packed[side][block] = true;
+      local_already_packed_[side][block] = true;
+    } else {
+      RUY_TRACE_INFO(TRYPACK_PREVIOUSLY_PACKED);
     }
     return true;
   }
@@ -200,61 +214,69 @@ struct TrMulTask final : Task {
         break;
       }
 #if RUY_OPT(PACK_AHEAD)
+      RUY_TRACE_INFO(ENSURE_PACKED_ENTER_RUN_AHEAD);
       const Side runahead_side = next_runahead_side;
       const int runahead_block = next_runahead_block[runahead_side];
       next_runahead_side = OtherSide(next_runahead_side);
-      if (runahead_block >= NumBlocksPerSide(runahead_side, block_map)) {
+      if (runahead_block >= NumBlocksPerSide(runahead_side, block_map_)) {
         continue;
       }
       int runahead_block_start, runahead_block_end;
-      GetBlockMatrixCoords(runahead_side, block_map, runahead_block,
+      GetBlockMatrixCoords(runahead_side, block_map_, runahead_block,
                            &runahead_block_start, &runahead_block_end);
       TryPack(runahead_side, runahead_block, runahead_block_start,
               runahead_block_end, tuning);
       next_runahead_block[runahead_side] = runahead_block + 1;
 #endif
     }
+    RUY_TRACE_INFO(ENSURE_PACKED_END);
   }
 
-  TrMulParams* params;
-  const BlockMap& block_map;
-  std::atomic<int>* atomic_block_id;
-  int thread_id;
-  bool need_atomics;
-  SidePair<std::atomic<PackingStatus>*> packing_status;
-  TuningResolver* tuning_resolver;
-  Allocator* local_allocator;
+  TrMulParams* params_;
+  const BlockMap& block_map_;
+  std::atomic<int>* atomic_block_id_;
+  int thread_id_;
+  bool need_atomics_;
+  SidePair<std::atomic<PackingStatus>*> packing_status_;
+  TuningResolver* tuning_resolver_;
+  Allocator* local_allocator_;
 
   // Local indicators of packedness to avoid the overhead of atomic ops.
-  SidePair<bool*> local_already_packed;
+  SidePair<bool*> local_already_packed_;
+
+  CpuInfo* cpuinfo_;
 };
 
-int GetThreadCount(Ctx* ctx, int rows, int cols, int depth) {
+int GetTentativeThreadCount(Ctx* ctx, int rows, int cols, int depth) {
 #if RUY_PLATFORM_EMSCRIPTEN
   // b/139927184, std::thread constructor raises exception
   return 1;
 #endif
+  RUY_TRACE_SCOPE;
   // Empirically determined rule for reasonable number of
   // threads to use. This is proportional to the number of arithmetic ops
   // in this Mul (product of the 3 sizes).
   static constexpr int kDivisorLog2 = 15;
   const int guess_log2 = std::max(
       0, ceil_log2(rows) + ceil_log2(cols) + ceil_log2(depth) - kDivisorLog2);
-  return std::min(1 << guess_log2, ctx->max_num_threads());
+  int tentative_thread_count =
+      std::min(1 << guess_log2, ctx->max_num_threads());
+  RUY_TRACE_INFO(GET_TENTATIVE_THREAD_COUNT);
+  return tentative_thread_count;
 }
 
-bool UseSimpleLoop(int tentative_thread_count, int rows, int cols, int depth,
-                   int lhs_scalar_size, int rhs_scalar_size,
-                   const CpuCacheParams& cpu_cache_params) {
+bool GetUseSimpleLoop(int tentative_thread_count, int rows, int cols, int depth,
+                      int lhs_scalar_size, int rhs_scalar_size,
+                      const CpuCacheParams& cpu_cache_params) {
+  RUY_TRACE_SCOPE;
   if (tentative_thread_count == 1) {
-    const BlockMapTraversalOrder traversal_order = GetTraversalOrder(
-        rows, cols, depth, lhs_scalar_size, rhs_scalar_size, cpu_cache_params);
-    // If we are in the GEMV case or the block_map would be using linear
-    // traversal anyway, use the simple loop.
-    if ((cols == 1) || traversal_order == BlockMapTraversalOrder::kLinear) {
+    if (IsObviouslyLinearTraversal(rows, cols, depth, lhs_scalar_size,
+                                   rhs_scalar_size, cpu_cache_params)) {
+      RUY_TRACE_INFO(GET_USE_SIMPLE_LOOP_RETURNS_TRUE);
       return true;
     }
   }
+  RUY_TRACE_INFO(GET_USE_SIMPLE_LOOP_RETURNS_FALSE);
   return false;
 }
 
@@ -267,6 +289,7 @@ bool UseSimpleLoop(int tentative_thread_count, int rows, int cols, int depth,
 // thread, the code that is potentially running on worker threads is in
 // TrMulTask::Run().
 void TrMul(Ctx* ctx, TrMulParams* params) {
+  RUY_TRACE_SCOPE;
   profiler::ScopeLabel label(
       "TrMul (Path=0x%x, max_num_threads=%d, is_prepacked=(%d,%d))",
       static_cast<int>(params->path), ctx->max_num_threads(),
@@ -281,17 +304,26 @@ void TrMul(Ctx* ctx, TrMulParams* params) {
   const int cols = rhs.layout.cols;
   const int depth = lhs.layout.rows;
 
-  const int tentative_thread_count = GetThreadCount(ctx, rows, cols, depth);
+  const int tentative_thread_count =
+      GetTentativeThreadCount(ctx, rows, cols, depth);
   const auto& cpu_cache_params = ctx->mutable_cpuinfo()->CacheParams();
+
+  // Suppress denormals to avoid computation inefficiency.
+  // Note this only handles the denormal suppression on the main thread. As for
+  // worker threads, the suppression is handled in each thread's main loop. See
+  // the corresponding code in thread_pool.cc for details.
+  ScopedSuppressDenormals suppress_denormals;
 
   // Case of running this TrMul as a simple loop.
   // This is a good place to start reading this function: all the rest
   // of this function is just an optimized, but functionally equivalent,
   // version of that.
-  if (UseSimpleLoop(tentative_thread_count, rows, cols, depth,
-                    lhs.data_type.size, rhs.data_type.size, cpu_cache_params)) {
+  if (GetUseSimpleLoop(tentative_thread_count, rows, cols, depth,
+                       lhs.data_type.size, rhs.data_type.size,
+                       cpu_cache_params)) {
     profiler::ScopeLabel label_simple("TrMulImpl, simple loop");
     Tuning tuning = ctx->GetMainThreadTuning();
+    RUY_TRACE_INFO(TRMUL_SIMPLE_LOOP);
 
     const SidePair<int> origin{0, 0};
     const SidePair<int> rounded_dims{packed_lhs.layout.cols,
@@ -306,6 +338,7 @@ void TrMul(Ctx* ctx, TrMulParams* params) {
   }
 
   profiler::ScopeLabel label_general("TrMulImpl, general case");
+  RUY_TRACE_INFO(TRMUL_GENERAL_CASE);
   Allocator* main_allocator = ctx->GetMainAllocator();
 
   // Initialize block map.
@@ -354,9 +387,9 @@ void TrMul(Ctx* ctx, TrMulParams* params) {
   for (int i = 0; i < thread_count; i++) {
     auto* allocator = ctx->GetThreadSpecificAllocator(i);
     auto* tuning_resolver = ctx->GetThreadSpecificTuningResolver(i);
-    new (tasks + i)
-        TrMulTask(params, block_map, atomic_block_id, i, need_atomics,
-                  packing_status, tuning_resolver, allocator);
+    new (tasks + i) TrMulTask(params, block_map, atomic_block_id, i,
+                              need_atomics, packing_status, tuning_resolver,
+                              allocator, ctx->mutable_cpuinfo());
   }
 
   // Do the computation.
